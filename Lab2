@@ -9,15 +9,17 @@ import torchvision.transforms as transforms
 from torchvision import models
 import torch.nn as nn
 import torch.optim as optim
+from torchvision.models import ResNet18_Weights
 import os
 os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 
 # global variables defining training hyper-parameters among other things 
-epochs = 5
+epochs = 10
 num_workers = 0
 minibatch_size = 16
 learning_rate = 0.01
-max_image=1000
+max_image=5000
+num_classes=80
 # device initialization
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using {device} device.")
@@ -84,7 +86,8 @@ val_loader = torch.utils.data.DataLoader(val_data, batch_size=minibatch_size,
                                          shuffle=False, num_workers=num_workers)
 
 # class definitions
-model = models.resnet18(pretrained=True)
+# model = models.resnet18(pretrained=True)
+model = models.resnet18(weights=ResNet18_Weights.DEFAULT)
 
 # print(f"Origine Model= {model}")
 # instantiation and preparation of network model
@@ -92,16 +95,20 @@ for param in model.parameters():
     param.requires_grad = False  # freezing the gradient
 model.fc=torch.nn.Linear(512,80)
 print(f"Model Modified !")
-print(model)
+# print(model)
 
 # instantiation of loss criterion
 criterion = nn.BCEWithLogitsLoss()
+# criterion = nn.BCELoss()
 # instantiation of optimizer, registration of network parameters
 optimizer=optim.Adam(model.parameters(),lr=learning_rate)
 print("Loss function:", criterion)
 print("Optimizer:", optimizer)
 # definition of current best model path
+best_model_accuracy=0.0
+best_model_path='./'
 # initialization of model selection metric
+
 # creation of tensorboard SummaryWriter (optional)
 
 # epochs loop:
@@ -114,13 +121,9 @@ def train_loop(train_loader, net, criterion, optimizer, device,
     running_loss = 0.0
     mbatch_losses = []
     for i, data in enumerate(train_loader):
-        inputs, labels = data[0].to(device), data[1].float().to(device)
-        # inputs, labels = data[0], data[1].float()
+        inputs, labels = data[0].to(device), data[1].to(device)
         optimizer.zero_grad()
         outputs = net(inputs)
-        
-        print(f"输入尺寸: {inputs.shape}, 标签尺寸: {labels.shape}, 输出尺寸: {outputs.shape}")
-        print(f"labels: {labels}")
         loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
@@ -134,7 +137,7 @@ def train_loop(train_loader, net, criterion, optimizer, device,
 
 
 def validation_loop(val_loader, net, criterion, num_classes, device,
-                    multi_task=False, th_multi_task=0.5, one_hot=False, class_metrics=False):
+                    multi_task=True, th_multi_task=0.5, one_hot=True, class_metrics=False):
     net.eval()
     loss = 0
     correct = 0
@@ -147,6 +150,7 @@ def validation_loop(val_loader, net, criterion, num_classes, device,
             images, labels = data[0].to(device), data[1].to(device)
             outputs = net(images)
             loss += criterion(outputs, labels).item() * images.size(0)
+            
             if not multi_task:    
                 predictions = torch.zeros_like(outputs)
                 predictions[torch.arange(outputs.shape[0]), torch.argmax(outputs, dim=1)] = 1.0
@@ -200,17 +204,23 @@ def validation_loop(val_loader, net, criterion, num_classes, device,
             f1 = (0 if p == r == 0 else 2. / (1/p + 1/r))
             class_results.append({"f1": f1, "precision": p, "recall": r})
         results = results, class_results
-
+    print(results)
     return results
-
 #move our model on GPU device
 model.to(device)
 for t in range(epochs):
-    print(f"EPOCH {t+1:2d}", 40*"-", flush=True)
+    print(f"Train EPOCH {t+1:2d}", 40*"-", flush=True)
     train_loop(train_loader, model, criterion, optimizer, device)
-    
-#   update graphs (optional)
-#   is new model better than current model ?
-#       save it, update current best metric
+    validation_loop(train_loader, model, criterion, num_classes, device)
+    print(f"Val_dataset :")
+    val_results = validation_loop(val_loader, model, criterion, num_classes, device)
+    #get current accuracy
+    val_accuracy = val_results['accuracy']
+    if val_accuracy > best_model_accuracy:
+        best_model_accuracy = val_accuracy
+        #save model with params
+        torch.save(model.state_dict(), os.path.join(best_model_path, 'best_model.pth'))
+        print(f"New best model saved with accuracy: {best_model_accuracy:.4f}")
 
+#   update graphs (optional)
 # close tensorboard SummaryWriter if created (optional)
