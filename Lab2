@@ -1,0 +1,216 @@
+# import statements for python, torch and companion libraries and your own modules
+import os
+from glob import glob
+from pathlib import Path
+
+from PIL import Image
+import torch
+import torchvision.transforms as transforms
+from torchvision import models
+import torch.nn as nn
+import torch.optim as optim
+import os
+os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+
+# global variables defining training hyper-parameters among other things 
+epochs = 5
+num_workers = 0
+minibatch_size = 16
+learning_rate = 0.01
+max_image=1000
+# device initialization
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using {device} device.")
+
+# data directories initialization
+annotation_dir= './labels/train'
+train_dir='./images/train-resized'
+test_dir='./images/test-resized'
+# instantiation of transforms, datasets and data loaders
+# TIP : use torch.utils.data.random_split to split the training set into train and validation subsets
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    ])
+
+class COCOTrainImageDataset(torch.utils.data.Dataset):
+    def __init__(self, img_dir, annotations_dir, max_images=None, transform=None):
+        self.img_labels = sorted(glob("*.cls", root_dir=annotations_dir))
+        if max_images:
+            self.img_labels = self.img_labels[:max_images]
+        self.img_dir = img_dir
+        self.annotations_dir = annotations_dir
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.img_labels)
+
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.img_dir, Path(self.img_labels[idx]).stem + ".jpg")
+        labels_path = os.path.join(self.annotations_dir, self.img_labels[idx])
+        image = Image.open(img_path).convert("RGB")
+        with open(labels_path) as f: 
+            labels = [int(label) for label in f.readlines()]
+        if self.transform:
+            image = self.transform(image)
+        labels = torch.zeros(80).scatter_(0, torch.tensor(labels), value=1)
+        return image, labels
+
+
+class COCOTestImageDataset(torch.utils.data.Dataset):
+    def __init__(self, img_dir, transform=None):
+        self.img_list = sorted(glob("*.jpg", root_dir=img_dir))    
+        self.img_dir = img_dir
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.img_list)
+
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.img_dir, self.img_list[idx])
+        image = Image.open(img_path).convert("RGB")        
+        if self.transform:
+            image = self.transform(image)
+        return image, Path(img_path).stem # filename w/o extension
+   
+myData = COCOTrainImageDataset(img_dir=train_dir, annotations_dir=annotation_dir, max_images=max_image, transform=transform)
+train_data,val_data=torch.utils.data.random_split(myData,[0.9,0.1])
+
+train_loader = torch.utils.data.DataLoader(train_data, batch_size=minibatch_size,
+                                           shuffle=True, num_workers=num_workers)
+
+val_loader = torch.utils.data.DataLoader(val_data, batch_size=minibatch_size,
+                                         shuffle=False, num_workers=num_workers)
+
+# class definitions
+model = models.resnet18(pretrained=True)
+
+# print(f"Origine Model= {model}")
+# instantiation and preparation of network model
+for param in model.parameters():
+    param.requires_grad = False  # freezing the gradient
+model.fc=torch.nn.Linear(512,80)
+print(f"Model Modified !")
+print(model)
+
+# instantiation of loss criterion
+criterion = nn.BCEWithLogitsLoss()
+# instantiation of optimizer, registration of network parameters
+optimizer=optim.Adam(model.parameters(),lr=learning_rate)
+print("Loss function:", criterion)
+print("Optimizer:", optimizer)
+# definition of current best model path
+# initialization of model selection metric
+# creation of tensorboard SummaryWriter (optional)
+
+# epochs loop:
+#   train
+#   validate on train set
+#   validate on validation set
+def train_loop(train_loader, net, criterion, optimizer, device,
+               mbatch_loss_group=-1):
+    net.train()
+    running_loss = 0.0
+    mbatch_losses = []
+    for i, data in enumerate(train_loader):
+        inputs, labels = data[0].to(device), data[1].float().to(device)
+        # inputs, labels = data[0], data[1].float()
+        optimizer.zero_grad()
+        outputs = net(inputs)
+        
+        print(f"输入尺寸: {inputs.shape}, 标签尺寸: {labels.shape}, 输出尺寸: {outputs.shape}")
+        print(f"labels: {labels}")
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item()
+        # following condition False by default, unless mbatch_loss_group > 0
+        if i % mbatch_loss_group == mbatch_loss_group - 1:
+            mbatch_losses.append(running_loss / mbatch_loss_group)
+            running_loss = 0.0
+    if mbatch_loss_group > 0:
+        return mbatch_losses
+
+
+def validation_loop(val_loader, net, criterion, num_classes, device,
+                    multi_task=False, th_multi_task=0.5, one_hot=False, class_metrics=False):
+    net.eval()
+    loss = 0
+    correct = 0
+    size = len(val_loader.dataset)
+    class_total = {label:0 for label in range(num_classes)}
+    class_tp = {label:0 for label in range(num_classes)}
+    class_fp = {label:0 for label in range(num_classes)}
+    with torch.no_grad():
+        for data in val_loader:
+            images, labels = data[0].to(device), data[1].to(device)
+            outputs = net(images)
+            loss += criterion(outputs, labels).item() * images.size(0)
+            if not multi_task:    
+                predictions = torch.zeros_like(outputs)
+                predictions[torch.arange(outputs.shape[0]), torch.argmax(outputs, dim=1)] = 1.0
+            else:
+                predictions = torch.where(outputs > th_multi_task, 1.0, 0.0)
+            if not one_hot:
+                labels_mat = torch.zeros_like(outputs)
+                labels_mat[torch.arange(outputs.shape[0]), labels] = 1.0
+                labels = labels_mat
+                
+            tps = predictions * labels
+            fps = predictions - tps
+            
+            tps = tps.sum(dim=0)
+            fps = fps.sum(dim=0)
+            lbls = labels.sum(dim=0)  
+                
+            for c in range(num_classes):
+                class_tp[c] += tps[c]
+                class_fp[c] += fps[c]
+                class_total[c] += lbls[c]
+                    
+            correct += tps.sum()
+
+    class_prec = []
+    class_recall = []
+    freqs = []
+    for c in range(num_classes):
+        class_prec.append(0 if class_tp[c] == 0 else
+                          class_tp[c] / (class_tp[c] + class_fp[c]))
+        class_recall.append(0 if class_tp[c] == 0 else
+                            class_tp[c] / class_total[c])
+        freqs.append(class_total[c])
+
+    freqs = torch.tensor(freqs)
+    class_weights = 1. / freqs
+    class_weights /= class_weights.sum()
+    class_prec = torch.tensor(class_prec)
+    class_recall = torch.tensor(class_recall)
+    prec = (class_prec * class_weights).sum()
+    recall = (class_recall * class_weights).sum()
+    f1 = 2. / (1/prec + 1/recall)
+    val_loss = loss / size
+    accuracy = correct / freqs.sum()
+    results = {"loss": val_loss, "accuracy": accuracy, "f1": f1,\
+               "precision": prec, "recall": recall}
+
+    if class_metrics:
+        class_results = []
+        for p, r in zip(class_prec, class_recall):
+            f1 = (0 if p == r == 0 else 2. / (1/p + 1/r))
+            class_results.append({"f1": f1, "precision": p, "recall": r})
+        results = results, class_results
+
+    return results
+
+#move our model on GPU device
+model.to(device)
+for t in range(epochs):
+    print(f"EPOCH {t+1:2d}", 40*"-", flush=True)
+    train_loop(train_loader, model, criterion, optimizer, device)
+    
+#   update graphs (optional)
+#   is new model better than current model ?
+#       save it, update current best metric
+
+# close tensorboard SummaryWriter if created (optional)
